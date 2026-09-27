@@ -2,7 +2,7 @@
 
 A Linux UCSI transport driver, packaged for DKMS, for the **Realtek RTS54xx** USB-C/PD controllers that ASUS boards expose in ACPI as **`RTK5452`**.
 
-Without this driver the controller has no Linux driver, and its port is missing from `/sys/class/typec/`. With it the port shows up in `typec`, with its data and power role, power mode, partner, and cable.
+Without this driver the controller has no Linux driver, and its port is missing from `/sys/class/typec/`. With it the port shows up in `typec`, with its data and power role, power mode, partner, and cable, and its PD source capabilities appear under `/sys/class/usb_power_delivery/`.
 
 Power delivery works either way, because the controller negotiates in its own firmware. The driver only makes that state visible to Linux.
 
@@ -29,7 +29,7 @@ Other ASUS boards that describe an `RTK5452` device will probably work too, but 
 The RTS54xx does not implement a UCSI mailbox. It is a PD controller with a vendor SMBus command set:
 
 1. **Unlock.** `VENDOR_CMD_ENABLE` (`01 03 DA 0B 01`) must be sent before the chip accepts anything else; until then every command returns `CMD_ERROR`. The driver sends it at probe, after every `PPM_RESET`, and on resume.
-2. **Command.** Standard UCSI commands are wrapped as `0E <len> <ucsi-cmd> 00 <params…>`. Three commands need their own vendor framing: `ACK_CC_CI` (`0A 07 …`), `SET_NOTIFICATION_ENABLE` (`08 06 01 …`), and `PPM_RESET`.
+2. **Command.** Standard UCSI commands are wrapped as `0E <len> <ucsi-cmd> 00 <params…>`. Four commands need their own vendor framing: `ACK_CC_CI` (`0A 07 …`), `SET_NOTIFICATION_ENABLE` (`08 06 01 …`), `GET_PDOS` (`08 03 83 00 <sel>`), and `PPM_RESET`.
 3. **Completion.** The driver polls a 1-byte ping status: `cmd_sts` in bits [1:0] (BUSY / DONE / DEFERRED / ERROR) and `data_len` in bits [7:2].
 4. **Response.** It then block-reads with command `0x80`; the first byte of the response is its byte count.
 5. **Events.** When something changes, the chip pulls the GPIO interrupt low. The driver reads the Alert Response Address (`0x0C`), which releases the line, and reports a connector change to the UCSI core.
@@ -38,7 +38,7 @@ The driver runs each command synchronously inside `async_control` and stores the
 
 ### Firmware quirks
 
-- **`GET_PDOS` is rejected** with `CMD_ERROR`, whatever arguments it is given. The driver reports this as *not supported*, so source capabilities can't be listed and the kernel logs `UCSI_GET_PDOS failed (-95)` at load. This is harmless.
+- **The UCSI form of `GET_PDOS` (`0E 05 10 …`) is rejected** with `CMD_ERROR`. The driver uses the vendor `GET_PDO` (`08 03 83 00 <sel>`) instead, which Realtek's own drivers use. Its selector byte is `source | partner<<1 | offset<<2 | count<<5`, and the response is the PDOs back to back, as in UCSI.
 - **`GET_IC_STATUS`** accepts a length of at most 31 (`0x1F`), completes with `data_len = 0`, and ignores the offset byte.
 - The connector-number field is ignored, because the controller has only one connector.
 
@@ -51,7 +51,7 @@ The driver runs each command synchronously inside `async_control` and stores the
 | Unload/reload | ✅ attached device not disturbed |
 | Hot-plug events (IRQ + ARA) | ✅ on unplug/replug the partner and cable are removed and re-created about 1 s after USB enumeration; about 5 interrupts per replug, no storm |
 | Suspend/resume | ⚠️ untested |
-| Source PDOs | ❌ firmware rejects `GET_PDOS` |
+| Source/sink/partner PDOs | ✅ via vendor `GET_PDO`; on the ProArt, C6 advertises 5 V 3 A, 9 V 3 A, 12 V 2.5 A, 15 V 2 A, PPS 5–11 V 3 A, PPS 5–16 V 2 A |
 
 If the interrupt line keeps firing without the chip answering the ARA, the driver disables the IRQ after 200 misses in a row and logs a warning. The port stays registered, but it won't report changes.
 
@@ -99,6 +99,10 @@ sudo i2ctransfer -f -y 0 w5@0x65 0x3A 0x03 0x00 0x00 0x1F   # GET_IC_STATUS
 sudo i2ctransfer -f -y 0 r1@0x65                            # ping status
 sudo i2ctransfer -f -y 0 w1@0x65 0x80 r32@0x65              # block read
 ```
+
+## Prior art
+
+Realtek's own `drivers/usb/dwc3/rtk-rts5400.c` (2017, in their vendor 4.9 BSP for RTD129x set-top SoCs) talks to the same command set. It is a board-support helper, not a Type-C driver: it binds through device tree, keeps a single global device, reads status and PDOs once at probe to log them and set a 12 V GPIO, and registers nothing with the `typec` or UCSI subsystems. It has no interrupt handling, and its suspend/resume hooks are empty. It was never submitted upstream. It was, however, the reference for the vendor `GET_PDO` framing.
 
 ## License
 

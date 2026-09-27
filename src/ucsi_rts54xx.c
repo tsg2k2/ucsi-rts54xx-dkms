@@ -4,7 +4,7 @@
  *
  * The RTS54xx is a PD controller (PDC) with a vendor SMBus command set rather
  * than a UCSI mailbox. Standard UCSI commands are tunnelled through vendor
- * command 0x0E; a few (PPM_RESET, ACK_CC_CI, SET_NOTIFICATION_ENABLE) need
+ * command 0x0E; a few (PPM_RESET, ACK_CC_CI, SET_NOTIFICATION_ENABLE, GET_PDOS) need
  * their own framing. Each command is written, its completion polled through a
  * one-byte ping status, and any response fetched with block-read command 0x80.
  * This driver runs that exchange synchronously and presents the result to the
@@ -227,17 +227,8 @@ static u32 rts54_ucsi_command(struct ucsi_rts54 *rts, u64 command)
 
 	ret = rts54_exec(rts, buf, 4 + plen, rts->message_in,
 			 sizeof(rts->message_in), 0);
-	if (ret == -EREMOTEIO) {
-		/*
-		 * The ASUS firmware rejects GET_PDOS outright; report it as
-		 * unsupported so the core does not chase it with
-		 * GET_ERROR_STATUS.
-		 */
-		if (cmd == UCSI_GET_PDOS)
-			return UCSI_CCI_COMMAND_COMPLETE |
-			       UCSI_CCI_NOT_SUPPORTED;
+	if (ret == -EREMOTEIO)
 		return UCSI_CCI_COMMAND_COMPLETE | UCSI_CCI_ERROR;
-	}
 	if (ret < 0) {
 		dev_dbg(&rts->client->dev, "UCSI command 0x%02x failed: %d\n",
 			cmd, ret);
@@ -248,6 +239,43 @@ static u32 rts54_ucsi_command(struct ucsi_rts54 *rts, u64 command)
 		rts->pending_change = get_unaligned_le16(rts->message_in);
 
 	return UCSI_CCI_COMMAND_COMPLETE | UCSI_SET_CCI_LENGTH(ret);
+}
+
+/*
+ * The UCSI form of GET_PDOS (0x0E/0x10) is rejected by older firmware, so use
+ * the vendor GET_PDO (0x08/0x83) that Realtek's own drivers use. Its selector
+ * byte packs the same fields: bit 0 source, bit 1 partner, bits 4:2 offset,
+ * bits 7:5 count. The response is the PDOs back to back, as in UCSI.
+ */
+static u32 rts54_get_pdos(struct ucsi_rts54 *rts, u64 command)
+{
+	bool partner = command & UCSI_GET_PDOS_PARTNER_PDO(1);
+	bool source = command & UCSI_GET_PDOS_SRC_PDOS;
+	unsigned int offset = (command >> 24) & 0xff;
+	unsigned int num = ((command >> 32) & 0x3) + 1;
+	u8 buf[5];
+	int ret;
+
+	/* The controller holds at most 7 PDOs per list */
+	if (offset > 7)
+		return UCSI_CCI_COMMAND_COMPLETE;
+	num = min(num, 8 - offset);
+
+	buf[0] = 0x08;
+	buf[1] = 0x03;
+	buf[2] = 0x83;
+	buf[3] = 0x00;
+	buf[4] = source | partner << 1 | (offset & 0x7) << 2 | (num & 0x7) << 5;
+
+	ret = rts54_exec(rts, buf, sizeof(buf), rts->message_in,
+			 num * sizeof(u32), 0);
+	if (ret < 0) {
+		dev_dbg(&rts->client->dev, "GET_PDO failed: %d\n", ret);
+		return UCSI_CCI_COMMAND_COMPLETE | UCSI_CCI_ERROR;
+	}
+
+	return UCSI_CCI_COMMAND_COMPLETE |
+	       UCSI_SET_CCI_LENGTH(round_down(ret, sizeof(u32)));
 }
 
 static u32 rts54_ack_cc_ci(struct ucsi_rts54 *rts, u64 command)
@@ -373,6 +401,9 @@ static int ucsi_rts54_async_control(struct ucsi *ucsi, u64 command)
 		break;
 	case UCSI_SET_NOTIFICATION_ENABLE:
 		cci = rts54_set_notification_enable(rts, command);
+		break;
+	case UCSI_GET_PDOS:
+		cci = rts54_get_pdos(rts, command);
 		break;
 	default:
 		cci = rts54_ucsi_command(rts, command);
