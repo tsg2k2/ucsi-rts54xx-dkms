@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The driver includes the UCSI core's private header "ucsi.h", whose struct
+# layouts change between kernel series, so the copy matching the target
+# kernel is picked from headers/<major>.<minor>/.
+
+UCSI_SERIES := $(word 1,$(subst ., ,$(KERNELRELEASE))).$(word 2,$(subst ., ,$(KERNELRELEASE)))
+UCSI_HDIR   := $(src)/headers/$(UCSI_SERIES)
+
+ifeq ($(wildcard $(UCSI_HDIR)/ucsi.h),)
+$(error ucsi-rts54xx: no bundled ucsi.h for kernel series $(UCSI_SERIES); add headers/$(UCSI_SERIES)/ucsi.h from that kernel's drivers/usb/typec/ucsi/)
+endif
+
+# Distro kernels can carry partial UCSI backports that match no upstream
+# header. The 7.2+ headers declare ucsi_write_message_out_command(); if the
+# kernel does not export it, its ucsi_operations layout differs and loading
+# the module would be unsafe.
+ifneq ($(wildcard $(objtree)/Module.symvers),)
+ifeq ($(shell grep -qw ucsi_write_message_out_command $(objtree)/Module.symvers && echo y),)
+$(error ucsi-rts54xx: $(KERNELRELEASE) does not export ucsi_write_message_out_command; its UCSI core does not match headers/$(UCSI_SERIES)/ucsi.h)
+endif
+endif
+
+ccflags-y += -I$(UCSI_HDIR)
+obj-m += ucsi_rts54xx.o
