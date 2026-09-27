@@ -49,7 +49,7 @@ The driver runs each command synchronously inside `async_control` and stores the
 | Probe, unlock, chip identification | ✅ |
 | PPM reset, capabilities, connector capability/status, cable | ✅ `/sys/class/typec/portN` with partner and cable |
 | Unload/reload | ✅ attached device not disturbed |
-| Hot-plug events (IRQ + ARA) | ⚠️ the IRQ fires, but a replug on the port hasn't been tested yet |
+| Hot-plug events (IRQ + ARA) | ✅ on unplug/replug the partner and cable are removed and re-created about 1 s after USB enumeration; about 5 interrupts per replug, no storm |
 | Suspend/resume | ⚠️ untested |
 | Source PDOs | ❌ firmware rejects `GET_PDOS` |
 
