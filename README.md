@@ -36,11 +36,40 @@ The RTS54xx does not implement a UCSI mailbox. It is a PD controller with a vend
 
 The driver runs each command synchronously inside `async_control` and stores the result as CCI and MESSAGE_IN, so the UCSI core sees an ordinary PPM. It reports **UCSI 1.2**, because `GET_CONNECTOR_STATUS` returns the 9-byte 1.x layout.
 
+### Partner and cable identity
+
+UCSI 1.x has no `GET_PD_MESSAGE`, so the core can't read Discover Identity and `portN-partner/identity` would stay empty. The driver advertises the capability and answers the command itself from the vendor `GET_VDO` (`08 <3+n> 9A 00 <n|origin<<3> <types…>`), the same way ChromeOS does. The controller returns stale VDOs when nothing was discovered, so SOP identity is only reported while there is a PD contract, and SOP′ only with an e-marked cable. Otherwise the identity is all zeros.
+
+## Port controls
+
+The driver adds controls under `/sys/bus/i2c/devices/i2c-RTK5452:00/rts54xx/`. They talk to the controller's PD policy directly, and the resulting attach/detach events reach `typec` through the normal alert path.
+
+| File | | What it does |
+|---|---|---|
+| `power_cycle` | W | `echo 1` (1 s) or `echo <ms>` (100–10000): Type-C disconnect, wait, reconnect. The controller drops VBUS while detached, so this is a **software unplug/replug** of whatever is on the port |
+| `reconnect` | W | `echo 1`: `SET_TPC_RECONNECT` (`08 03 1F 00 01`), a detach/attach cycle done by the controller |
+| `disconnect` | RW | `echo 1` holds the port detached (`SET_TPC_DISCONNECT`, `08 02 23 00`); `echo 0` reconnects |
+| `tpc_rp` | RW | Advertised Type-C / PD Rp current: `default`, `1.5A`, `3.0A` (`GET/SET_TPC_RP`, `08 02 85` / `08 03 05`) |
+| `source_pdos` | RW | Read: the source PDOs, decoded. Write: up to 7 hex PDOs (the first must be fixed 5 V), or `restore` for the firmware list captured at probe. Uses `SET_PDO` (`08 <3+4n> 03 00 <n\|src<<3> …`), then re-sends Source_Capabilities |
+| `rdo` | R | The partner's current request (`GET_RDO`, `08 02 84 00`), or `none` without a PD contract |
+| `partner_source_pdo` | R | `GET_CURRENT_PARTNER_SRC_PDO` (`08 02 A7 00`); only meaningful on a sink-capable port |
+| `pd_ams` | W | Start a PD sequence: `source_cap`, `soft_reset`, `hard_reset`, `goto_min`, `get_sink_cap`, `get_source_cap` (`INIT_PD_AMS`, `08 03 20 00 <n>`) |
+| `tcpm_reset` | W | `echo 1`: reset the controller's PD stack (`08 03 00 00 01`) |
+
+`debugfs` (`/sys/kernel/debug/usb/rts54xx-i2c-RTK5452:00/`):
+
+- `rtk_status`: raw 14-byte `GET_RTK_STATUS` block.
+- `force_power_switch`: raw `FORCE_SET_POWER_SWITCH` byte (bit 6 + [1:0] = VBSIN, bit 7 + [3:2] = LP). On the ProArt both switch states read 0 while the port sources 3 A, which suggests VBUS goes through an external switch that this command doesn't control. Use `power_cycle` instead. This one is experimental.
+
+The command framings come from Realtek's own 6.6 BSP driver (`drivers/usb/typec/rts54xx.c`) and ChromiumOS `pdc_rts54xx.c`.
+
 ### Firmware quirks
 
 - **The UCSI form of `GET_PDOS` (`0E 05 10 …`) is rejected** with `CMD_ERROR`. The driver uses the vendor `GET_PDO` (`08 03 83 00 <sel>`) instead, which Realtek's own drivers use. Its selector byte is `source | partner<<1 | offset<<2 | count<<5`, and the response is the PDOs back to back, as in UCSI.
 - **`GET_IC_STATUS`** accepts a length of at most 31 (`0x1F`), completes with `data_len = 0`, and ignores the offset byte.
 - The connector-number field is ignored, because the controller has only one connector.
+- `GET_RTK_STATUS` ends at byte 14, so the power-reading fields (average current, voltage) that newer firmware has at bytes 15–19 are missing. `READ_POWER_LEVEL` and `GET_POWER_SWITCH_STATE` are rejected. **There is no way to read a live wattage** on this firmware; `hwmon ucsi_source_psy_*` shows only the negotiated contract.
+- `GET_TPC_RP` returns `0x3f`: Type-C Rp and PD Rp are both 3 (3.0 A).
 
 ## Status
 
@@ -51,6 +80,9 @@ The driver runs each command synchronously inside `async_control` and stores the
 | Unload/reload | ✅ attached device not disturbed |
 | Hot-plug events (IRQ + ARA) | ✅ on unplug/replug the partner and cable are removed and re-created about 1 s after USB enumeration; about 5 interrupts per replug, no storm |
 | Suspend/resume | ⚠️ untested |
+| Read-only controls (`tpc_rp`, `rdo`, `source_pdos` read, `partner_source_pdo`, `rtk_status`) | ✅ framing verified on the chip; the driver paths are untested until the next reload |
+| Identity emulation (`GET_PD_MESSAGE` via `GET_VDO`) | ⚠️ `GET_VDO` verified on the chip (port identity VID 0x0BDA / PID 0x5450); a PD partner hasn't been tested yet |
+| `power_cycle`, `reconnect`, `disconnect`, `tpc_rp` write, `source_pdos` write, `pd_ams`, `tcpm_reset` | ⚠️ written, not yet exercised; they change the port state, so they're waiting until the attached device can be interrupted |
 | Source/sink/partner PDOs | ✅ via vendor `GET_PDO`; on the ProArt, C6 advertises 5 V 3 A, 9 V 3 A, 12 V 2.5 A, 15 V 2 A, PPS 5–11 V 3 A, PPS 5–16 V 2 A |
 
 If the interrupt line keeps firing without the chip answering the ARA, the driver disables the IRQ after 200 misses in a row and logs a warning. The port stays registered, but it won't report changes.
