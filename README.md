@@ -84,7 +84,9 @@ The command framings come from Realtek's own 6.6 BSP driver (`drivers/usb/typec/
 | Read-only controls (`tpc_rp`, `rdo`, `source_pdos` read, `partner_source_pdo`, `rtk_status`) | ✅ framing verified on the chip; the driver paths are untested until the next reload |
 | Identity emulation (`GET_PD_MESSAGE` via `GET_VDO`) | ⚠️ `GET_VDO` verified on the chip (port identity VID 0x0BDA / PID 0x5450); a PD partner hasn't been tested yet |
 | `power_cycle`, `reconnect`, `disconnect` | ✅ verified 2026-10-05 on C6 with an RTL8159 10G NIC: it drops and comes back at Gen 2x2 every time; off time = hold + ~0.68 s (3 s → 3.68 s, 8 s → 8.68 s) |
-| `tpc_rp` write, `source_pdos` write, `pd_ams`, `tcpm_reset` | ⚠️ written, not yet exercised. `tcpm_reset` matches the BSP framing (`08 03 00 00 01`) but returned an I/O error once, with the port detached |
+| `tcpm_reset` | ✅ verified 2026-10-05: the port detaches and re-attaches in ~1.4 s. The controller leaves the ping status at CMD_DEFERRED for this command (the reset takes the command state with it), so the driver takes DEFERRED as accepted; before 0.6 it reported a false I/O error / timeout |
+| `tpc_rp` write | ✅ verified 2026-10-05: 3.0A ↔ 1.5A. The controller only flags a connector change when Rp goes down, so the driver reports a power op mode change itself and the typec `power_operation_mode` follows both ways (stale after an increase before 0.7) |
+| `source_pdos` write, `pd_ams` | ⚠️ written, not yet exercised: they need a PD-capable sink on the port |
 | Source/sink/partner PDOs | ✅ via vendor `GET_PDO`; on the ProArt, C6 advertises 5 V 3 A, 9 V 3 A, 12 V 2.5 A, 15 V 2 A, PPS 5–11 V 3 A, PPS 5–16 V 2 A |
 
 If the interrupt line keeps firing without the chip answering the ARA, the driver disables the IRQ after 200 misses in a row and logs a warning. The port stays registered, but it won't report changes.

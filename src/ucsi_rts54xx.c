@@ -109,6 +109,8 @@ struct ucsi_rts54 {
 	u8 message_in[RTS54_MAX_BLOCK];
 	/* Change bits from the last GET_CONNECTOR_STATUS, cleared on ACK */
 	u16 pending_change;
+	/* Change bits to report that the controller doesn't flag itself */
+	u16 synth_change;
 	unsigned int irq_misses;
 	bool irq_enabled;
 	bool registered;
@@ -279,8 +281,13 @@ static u32 rts54_ucsi_command(struct ucsi_rts54 *rts, u64 command)
 		return UCSI_CCI_COMMAND_COMPLETE | UCSI_CCI_ERROR;
 	}
 
-	if (cmd == UCSI_GET_CONNECTOR_STATUS && ret >= 2)
+	if (cmd == UCSI_GET_CONNECTOR_STATUS && ret >= 2) {
+		/* ACK only what the controller reported; add ours on top */
 		rts->pending_change = get_unaligned_le16(rts->message_in);
+		put_unaligned_le16(rts->pending_change | rts->synth_change,
+				   rts->message_in);
+		rts->synth_change = 0;
+	}
 
 	/* GET_PD_MESSAGE is emulated below; advertise it (features bit 8) */
 	if (cmd == UCSI_GET_CAPABILITY && ret > 6)
@@ -477,6 +484,7 @@ static u32 rts54_reset_ppm(struct ucsi_rts54 *rts)
 			 ret);
 
 	rts->pending_change = 0;
+	rts->synth_change = 0;
 
 	return UCSI_CCI_RESET_COMPLETE;
 }
@@ -887,7 +895,20 @@ static ssize_t tpc_rp_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 
 	ret = rts54_vendor(rts, RTS54_SUB_SET_TPC_RP, 1, i << 2 | i << 4);
-	return ret < 0 ? ret : count;
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * The controller raises a connector change when Rp goes down but not
+	 * when it goes back up, so the typec power_operation_mode went stale.
+	 * Report a power op mode change ourselves so the core re-reads it.
+	 */
+	mutex_lock(&rts->lock);
+	rts->synth_change |= UCSI_CONSTAT_POWER_OPMODE_CHANGE;
+	mutex_unlock(&rts->lock);
+	ucsi_notify_common(rts->ucsi, 1 << 1);
+
+	return count;
 }
 static DEVICE_ATTR_RW(tpc_rp);
 
@@ -1023,6 +1044,55 @@ static ssize_t pd_ams_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(pd_ams);
 
+/*
+ * TCPM_RESET (08 03 00 00 01, as in Realtek's BSP) restarts the controller's
+ * port state machine. The ping status then stays CMD_DEFERRED instead of
+ * reaching CMD_DONE, since the reset takes the command state with it, so the
+ * normal wait times out although the reset works: the port detaches and
+ * re-attaches in about 1.4 s. Realtek's BSP would time out the same way.
+ * Take DEFERRED as "accepted" for this command.
+ */
+static int rts54_tcpm_reset(struct ucsi_rts54 *rts)
+{
+	static const u8 cmd[] = { RTS54_CMD_VENDOR, 0x03, RTS54_SUB_TCPM_RESET,
+				  0x00, 0x01 };
+	unsigned long timeout;
+	int ret;
+	u8 ping;
+
+	mutex_lock(&rts->lock);
+
+	ret = rts54_write(rts, cmd, sizeof(cmd));
+	if (ret)
+		goto out;
+
+	timeout = jiffies + msecs_to_jiffies(RTS54_TIMEOUT_MS);
+	do {
+		usleep_range(RTS54_POLL_US, RTS54_POLL_US + 2000);
+
+		ret = i2c_master_recv(rts->client, &ping, 1);
+		if (ret != 1) {
+			ret = ret < 0 ? ret : -EIO;
+			goto out;
+		}
+
+		switch (RTS54_PING_STS(ping)) {
+		case RTS54_STS_DONE:
+		case RTS54_STS_DEFERRED:
+			ret = 0;
+			goto out;
+		case RTS54_STS_ERROR:
+			ret = -EREMOTEIO;
+			goto out;
+		}
+	} while (time_before(jiffies, timeout));
+
+	ret = -ETIMEDOUT;
+out:
+	mutex_unlock(&rts->lock);
+	return ret;
+}
+
 static ssize_t tcpm_reset_store(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count)
@@ -1034,7 +1104,7 @@ static ssize_t tcpm_reset_store(struct device *dev,
 	if (kstrtobool(buf, &val) || !val)
 		return -EINVAL;
 
-	ret = rts54_vendor(rts, RTS54_SUB_TCPM_RESET, 1, 0x01);
+	ret = rts54_tcpm_reset(rts);
 	return ret < 0 ? ret : count;
 }
 static DEVICE_ATTR_WO(tcpm_reset);
