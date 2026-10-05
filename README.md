@@ -46,9 +46,10 @@ The driver adds controls under `/sys/bus/i2c/devices/i2c-RTK5452:00/rts54xx/`. T
 
 | File | | What it does |
 |---|---|---|
-| `power_cycle` | W | `echo 1` (1 s) or `echo <ms>` (100–10000): Type-C disconnect, wait, reconnect. The controller drops VBUS while detached, so this is a **software unplug/replug** of whatever is on the port |
-| `reconnect` | W | `echo 1`: `SET_TPC_RECONNECT` (`08 03 1F 00 01`), a detach/attach cycle done by the controller |
-| `disconnect` | RW | `echo 1` holds the port detached (`SET_TPC_DISCONNECT`, `08 02 23 00`); `echo 0` reconnects |
+| `power_cycle` | W | Software unplug/replug: `SET_TPC_DISCONNECT`, hold, `SET_TPC_RECONNECT`. `echo 1` holds for `power_cycle_ms`; `echo <ms>` (100–30000) holds that long. VBUS is off for the hold, so the device's capacitors discharge and its controller resets. Measured on the ProArt C6 port: USB disconnect to next enumeration = hold + ~0.68 s |
+| `power_cycle_ms` | RW | Default hold for `echo 1 > power_cycle`, in ms (default 2000, 100–30000) |
+| `reconnect` | W | `echo 1`: `SET_TPC_RECONNECT` (`08 03 1F 00 01`). On a connected port the controller detaches and re-attaches by itself with a fixed ~0.64 s off time (the argument byte makes no difference; 0x01, 0x05, 0x0a and 0x32 all measured the same). After `disconnect` it re-attaches the port |
+| `disconnect` | W | `echo 1` detaches the port and keeps VBUS off (`SET_TPC_DISCONNECT`, `08 02 23 00`, from Realtek's BSP command table, where it is defined but never called); `echo 0` or `reconnect` re-attaches |
 | `tpc_rp` | RW | Advertised Type-C / PD Rp current: `default`, `1.5A`, `3.0A` (`GET/SET_TPC_RP`, `08 02 85` / `08 03 05`) |
 | `source_pdos` | RW | Read: the source PDOs, decoded. Write: up to 7 hex PDOs (the first must be fixed 5 V), or `restore` for the firmware list captured at probe. Uses `SET_PDO` (`08 <3+4n> 03 00 <n\|src<<3> …`), then re-sends Source_Capabilities |
 | `rdo` | R | The partner's current request (`GET_RDO`, `08 02 84 00`), or `none` without a PD contract |
@@ -82,7 +83,8 @@ The command framings come from Realtek's own 6.6 BSP driver (`drivers/usb/typec/
 | Suspend/resume | ⚠️ untested |
 | Read-only controls (`tpc_rp`, `rdo`, `source_pdos` read, `partner_source_pdo`, `rtk_status`) | ✅ framing verified on the chip; the driver paths are untested until the next reload |
 | Identity emulation (`GET_PD_MESSAGE` via `GET_VDO`) | ⚠️ `GET_VDO` verified on the chip (port identity VID 0x0BDA / PID 0x5450); a PD partner hasn't been tested yet |
-| `power_cycle`, `reconnect`, `disconnect`, `tpc_rp` write, `source_pdos` write, `pd_ams`, `tcpm_reset` | ⚠️ written, not yet exercised; they change the port state, so they're waiting until the attached device can be interrupted |
+| `power_cycle`, `reconnect`, `disconnect` | ✅ verified 2026-10-05 on C6 with an RTL8159 10G NIC: it drops and comes back at Gen 2x2 every time; off time = hold + ~0.68 s (3 s → 3.68 s, 8 s → 8.68 s) |
+| `tpc_rp` write, `source_pdos` write, `pd_ams`, `tcpm_reset` | ⚠️ written, not yet exercised. `tcpm_reset` matches the BSP framing (`08 03 00 00 01`) but returned an I/O error once, with the port detached |
 | Source/sink/partner PDOs | ✅ via vendor `GET_PDO`; on the ProArt, C6 advertises 5 V 3 A, 9 V 3 A, 12 V 2.5 A, 15 V 2 A, PPS 5–11 V 3 A, PPS 5–16 V 2 A |
 
 If the interrupt line keeps firing without the chip answering the ARA, the driver disables the IRQ after 200 misses in a row and logs a warning. The port stays registered, but it won't report changes.

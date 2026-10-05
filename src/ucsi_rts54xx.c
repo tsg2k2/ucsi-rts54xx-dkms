@@ -115,7 +115,8 @@ struct ucsi_rts54 {
 	/* Firmware source PDOs captured at probe, for source_pdos "restore" */
 	u32 default_pdos[RTS54_MAX_PDOS];
 	int num_default_pdos;
-	bool disconnected;
+	/* Hold time for power_cycle when written a plain "1" */
+	unsigned int power_cycle_ms;
 	struct dentry *debugfs;
 };
 
@@ -737,6 +738,29 @@ static int rts54_format_pdo(char *buf, int at, u32 pdo)
 	}
 }
 
+/*
+ * Port detach/attach. SET_TPC_DISCONNECT (08 02 23 00, from Realtek's BSP
+ * command table) detaches the port and holds it detached with VBUS off;
+ * SET_TPC_RECONNECT (08 03 1F 00 01, as ChromiumOS sends it) attaches it
+ * again. Reconnect on a connected port is a detach/attach of its own with a
+ * fixed ~0.6 s off time. Its argument byte has no visible effect.
+ * Measured on the ProArt C6 port: disconnect, hold N ms, reconnect gives
+ * N + ~680 ms between the USB disconnect and the next enumeration.
+ */
+#define RTS54_POWER_CYCLE_MS_DEFAULT	2000
+#define RTS54_POWER_CYCLE_MS_MIN	100
+#define RTS54_POWER_CYCLE_MS_MAX	30000
+
+static int rts54_tpc_disconnect(struct ucsi_rts54 *rts)
+{
+	return rts54_vendor(rts, RTS54_SUB_SET_TPC_DISCONNECT, 0, 0);
+}
+
+static int rts54_tpc_reconnect(struct ucsi_rts54 *rts)
+{
+	return rts54_vendor(rts, RTS54_SUB_SET_TPC_RECONNECT, 1, 0x01);
+}
+
 static ssize_t reconnect_store(struct device *dev,
 			       struct device_attribute *attr,
 			       const char *buf, size_t count)
@@ -748,21 +772,10 @@ static ssize_t reconnect_store(struct device *dev,
 	if (kstrtobool(buf, &val) || !val)
 		return -EINVAL;
 
-	ret = rts54_vendor(rts, RTS54_SUB_SET_TPC_RECONNECT, 1, 0x01);
-	if (ret < 0)
-		return ret;
-	rts->disconnected = false;
-	return count;
+	ret = rts54_tpc_reconnect(rts);
+	return ret < 0 ? ret : count;
 }
 static DEVICE_ATTR_WO(reconnect);
-
-static ssize_t disconnect_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
-{
-	struct ucsi_rts54 *rts = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", rts->disconnected);
-}
 
 static ssize_t disconnect_store(struct device *dev,
 				struct device_attribute *attr,
@@ -775,20 +788,40 @@ static ssize_t disconnect_store(struct device *dev,
 	if (kstrtobool(buf, &val))
 		return -EINVAL;
 
-	if (val)
-		ret = rts54_vendor(rts, RTS54_SUB_SET_TPC_DISCONNECT, 0, 0);
-	else
-		ret = rts54_vendor(rts, RTS54_SUB_SET_TPC_RECONNECT, 1, 0x01);
-	if (ret < 0)
-		return ret;
-	rts->disconnected = val;
+	ret = val ? rts54_tpc_disconnect(rts) : rts54_tpc_reconnect(rts);
+	return ret < 0 ? ret : count;
+}
+static DEVICE_ATTR_WO(disconnect);
+
+static ssize_t power_cycle_ms_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct ucsi_rts54 *rts = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", rts->power_cycle_ms);
+}
+
+static ssize_t power_cycle_ms_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct ucsi_rts54 *rts = dev_get_drvdata(dev);
+	unsigned int ms;
+
+	if (kstrtouint(buf, 0, &ms))
+		return -EINVAL;
+	if (ms < RTS54_POWER_CYCLE_MS_MIN || ms > RTS54_POWER_CYCLE_MS_MAX)
+		return -ERANGE;
+
+	rts->power_cycle_ms = ms;
 	return count;
 }
-static DEVICE_ATTR_RW(disconnect);
+static DEVICE_ATTR_RW(power_cycle_ms);
 
 /*
- * Detach the port at the Type-C level, which makes the controller drop VBUS,
- * then attach again: a software unplug/replug of whatever is connected.
+ * Software unplug/replug: detach, hold VBUS off long enough for the
+ * device's capacitors to discharge and its controller to reset, attach.
+ * "1" uses power_cycle_ms; any other value is the hold time in ms.
  */
 static ssize_t power_cycle_store(struct device *dev,
 				 struct device_attribute *attr,
@@ -801,22 +834,18 @@ static ssize_t power_cycle_store(struct device *dev,
 	if (kstrtouint(buf, 0, &ms))
 		return -EINVAL;
 	if (ms == 1)
-		ms = 1000;
-	if (ms < 100 || ms > 10000)
+		ms = rts->power_cycle_ms;
+	if (ms < RTS54_POWER_CYCLE_MS_MIN || ms > RTS54_POWER_CYCLE_MS_MAX)
 		return -ERANGE;
 
-	ret = rts54_vendor(rts, RTS54_SUB_SET_TPC_DISCONNECT, 0, 0);
+	ret = rts54_tpc_disconnect(rts);
 	if (ret < 0)
 		return ret;
-	rts->disconnected = true;
 
 	msleep(ms);
 
-	ret = rts54_vendor(rts, RTS54_SUB_SET_TPC_RECONNECT, 1, 0x01);
-	if (ret < 0)
-		return ret;
-	rts->disconnected = false;
-	return count;
+	ret = rts54_tpc_reconnect(rts);
+	return ret < 0 ? ret : count;
 }
 static DEVICE_ATTR_WO(power_cycle);
 
@@ -1014,6 +1043,7 @@ static struct attribute *rts54_attrs[] = {
 	&dev_attr_reconnect.attr,
 	&dev_attr_disconnect.attr,
 	&dev_attr_power_cycle.attr,
+	&dev_attr_power_cycle_ms.attr,
 	&dev_attr_tpc_rp.attr,
 	&dev_attr_rdo.attr,
 	&dev_attr_source_pdos.attr,
@@ -1123,6 +1153,7 @@ static int ucsi_rts54_probe(struct i2c_client *client)
 
 	rts->client = client;
 	mutex_init(&rts->lock);
+	rts->power_cycle_ms = RTS54_POWER_CYCLE_MS_DEFAULT;
 	i2c_set_clientdata(client, rts);
 
 	ret = rts54_init_chip(rts);
