@@ -84,7 +84,7 @@ The command framings come from Realtek's own 6.6 BSP driver (`drivers/usb/typec/
 | Read-only controls (`tpc_rp`, `rdo`, `source_pdos` read, `partner_source_pdo`, `rtk_status`) | ✅ framing verified on the chip; the driver paths are untested until the next reload |
 | Identity emulation (`GET_PD_MESSAGE` via `GET_VDO`) | ⚠️ `GET_VDO` verified on the chip (port identity VID 0x0BDA / PID 0x5450); a PD partner hasn't been tested yet |
 | `power_cycle`, `reconnect`, `disconnect` | ✅ verified 2026-10-05 on C6 with an RTL8159 10G NIC: it drops and comes back at Gen 2x2 every time; off time = hold + ~0.68 s (3 s → 3.68 s, 8 s → 8.68 s) |
-| `tcpm_reset` | ✅ verified 2026-10-05: the port detaches and re-attaches in ~1.4 s. The controller leaves the ping status at CMD_DEFERRED for this command (the reset takes the command state with it), so the driver takes DEFERRED as accepted; before 0.6 it reported a false I/O error / timeout |
+| `tcpm_reset` | ✅ verified 2026-10-05: the port detaches and re-attaches in ~1.4 s. The controller leaves the ping status at CMD_DEFERRED for this command (the reset takes the command state with it), so the driver takes DEFERRED as accepted; before 0.6 it reported a false I/O error / timeout. ⚠️ After a `reconnect` or `power_cycle`, the next `tcpm_reset` makes the controller send USB-PD Hard Resets to a non-PD device, which never answers: 3 VBUS cycles 6.0 s apart (tNoResponse + nHardResetCount = 2), reported as PD_RESET_COMPLETE. A `tcpm_reset` without a preceding reconnect is a single cycle |
 | `tpc_rp` write | ✅ verified 2026-10-05: 3.0A ↔ 1.5A. The controller only flags a connector change when Rp goes down, so the driver reports a power op mode change itself and the typec `power_operation_mode` follows both ways (stale after an increase before 0.7) |
 | `source_pdos` write, `pd_ams` | ⚠️ written, not yet exercised: they need a PD-capable sink on the port |
 | Source/sink/partner PDOs | ✅ via vendor `GET_PDO`; on the ProArt, C6 advertises 5 V 3 A, 9 V 3 A, 12 V 2.5 A, 15 V 2 A, PPS 5–11 V 3 A, PPS 5–16 V 2 A |
@@ -125,6 +125,14 @@ The UCSI core's debugfs interface can send raw commands:
 D=/sys/kernel/debug/usb/ucsi/i2c-RTK5452:00
 echo 0x10012 | sudo tee $D/command && sudo cat $D/response   # GET_CONNECTOR_STATUS
 echo 0x10007 | sudo tee $D/command && sudo cat $D/response   # GET_CONNECTOR_CAPABILITY
+```
+
+Every controller command, alert and `tcpm_reset` outcome is traced with `dev_dbg`. Turn it on with dynamic debug:
+
+```sh
+echo 'module ucsi_rts54xx +pt' | sudo tee /sys/kernel/debug/dynamic_debug/control
+# e.g. "cmd 0e 03 12 00 01 -> ping 37 (0x25)": command bytes, final ping (status in bits 1:0, length in 7:2)
+echo 'module ucsi_rts54xx -p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 ```
 
 The controller can also be probed from userspace with `i2c-tools`. Unbind the driver first so the two don't interleave transactions:

@@ -205,6 +205,8 @@ static int rts54_exec(struct ucsi_rts54 *rts, const u8 *cmd, int cmd_len,
 		return ret;
 
 	ret = rts54_wait(rts);
+	dev_dbg(&rts->client->dev, "cmd %*ph -> ping %d (0x%02x)\n",
+		min(cmd_len, 6), cmd, ret, ret < 0 ? 0 : ret);
 	if (ret < 0)
 		return ret;
 	if (RTS54_PING_STS(ret) == RTS54_STS_ERROR)
@@ -614,6 +616,7 @@ static irqreturn_t ucsi_rts54_irq(int irq, void *data)
 	}
 
 	rts->irq_misses = 0;
+	dev_dbg(&rts->client->dev, "alert\n");
 	/* Single-connector controller: report a change on connector 1 */
 	ucsi_notify_common(rts->ucsi, 1 << 1);
 
@@ -1051,6 +1054,14 @@ static DEVICE_ATTR_WO(pd_ams);
  * normal wait times out although the reset works: the port detaches and
  * re-attaches in about 1.4 s. Realtek's BSP would time out the same way.
  * Take DEFERRED as "accepted" for this command.
+ *
+ * After a SET_TPC_RECONNECT (reconnect or power_cycle), the next TCPM_RESET
+ * makes the controller issue USB-PD Hard Resets instead: it waits
+ * tNoResponse for a PD reply, a non-PD sink never answers, and it retries
+ * nHardResetCount (2) times. That is three VBUS cycles 6.0 s apart, each
+ * reported as PD_RESET_COMPLETE, and no command from the host in between.
+ * A TCPM_RESET without a preceding reconnect, or after such a run, is a
+ * single cycle. The reconnect argument byte makes no difference.
  */
 static int rts54_tcpm_reset(struct ucsi_rts54 *rts)
 {
@@ -1058,7 +1069,7 @@ static int rts54_tcpm_reset(struct ucsi_rts54 *rts)
 				  0x00, 0x01 };
 	unsigned long timeout;
 	int ret;
-	u8 ping;
+	u8 ping = 0;
 
 	mutex_lock(&rts->lock);
 
@@ -1089,6 +1100,7 @@ static int rts54_tcpm_reset(struct ucsi_rts54 *rts)
 
 	ret = -ETIMEDOUT;
 out:
+	dev_dbg(&rts->client->dev, "tcpm_reset: %d (ping 0x%02x)\n", ret, ping);
 	mutex_unlock(&rts->lock);
 	return ret;
 }
